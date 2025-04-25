@@ -1,12 +1,18 @@
 package cmd
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +23,7 @@ func NewOciCmd() *cobra.Command {
 		Long:  `Publish a directory as an OCI image using crane.`,
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
+			imageName := args[0]
 			dir := args[1]
 
 			// Check if directory exists
@@ -34,37 +40,110 @@ func NewOciCmd() *cobra.Command {
 				return fmt.Errorf("failed to copy directory contents: directory does not exist")
 			}
 
-			// Check if crane is installed
-			if _, err := exec.LookPath("crane"); err != nil {
-				return fmt.Errorf("crane not found in PATH. Please install it first: https://github.com/google/go-containerregistry/tree/main/cmd/crane")
-			}
-
-			// Create a temporary directory for the OCI image
-			tempDir, err := os.MkdirTemp("", "oci-*")
+			// Create a temporary file for the tarball
+			tmpFile, err := os.CreateTemp("", "oci-*.tar.gz")
 			if err != nil {
-				return fmt.Errorf("failed to create temporary directory: %v", err)
+				return fmt.Errorf("failed to create temporary file: %v", err)
 			}
-			defer os.RemoveAll(tempDir)
+			defer os.Remove(tmpFile.Name())
+			defer tmpFile.Close()
 
-			// Create a tarball of the directory
-			tarPath := filepath.Join(tempDir, "layer.tar")
-			tarCmd := exec.Command("tar", "-czf", tarPath, "-C", dir, ".")
-			if output, err := tarCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to create tarball: %v: %s", err, output)
+			// Create a gzip writer
+			gw := gzip.NewWriter(tmpFile)
+			defer gw.Close()
+
+			// Create a tar writer
+			tw := tar.NewWriter(gw)
+			defer tw.Close()
+
+			// Walk through the directory and add files to the tarball
+			err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+
+				// Skip the root directory
+				if path == dir {
+					return nil
+				}
+
+				// Get the relative path
+				relPath, err := filepath.Rel(dir, path)
+				if err != nil {
+					return fmt.Errorf("failed to get relative path: %v", err)
+				}
+
+				// Create tar header
+				header, err := tar.FileInfoHeader(info, "")
+				if err != nil {
+					return fmt.Errorf("failed to create tar header: %v", err)
+				}
+				header.Name = relPath
+
+				// Write header
+				if err := tw.WriteHeader(header); err != nil {
+					return fmt.Errorf("failed to write tar header: %v", err)
+				}
+
+				// If it's a regular file, write its contents
+				if info.Mode().IsRegular() {
+					file, err := os.Open(path)
+					if err != nil {
+						return fmt.Errorf("failed to open file: %v", err)
+					}
+					defer file.Close()
+
+					if _, err := io.Copy(tw, file); err != nil {
+						return fmt.Errorf("failed to write file contents: %v", err)
+					}
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return fmt.Errorf("failed to create tarball: %v", err)
 			}
 
-			// Create the OCI image using crane
-			craneArgs := []string{"append"}
-			if strings.HasPrefix(name, "localhost:") || strings.HasPrefix(name, "127.0.0.1:") {
-				craneArgs = append(craneArgs, "--insecure")
+			// Close writers to ensure all data is written
+			if err := tw.Close(); err != nil {
+				return fmt.Errorf("failed to close tar writer: %v", err)
 			}
-			craneArgs = append(craneArgs, "--new_layer", tarPath, "--new_tag", name)
-			craneCmd := exec.Command("crane", craneArgs...)
-			if output, err := craneCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to create OCI image: %v: %s", err, output)
+			if err := gw.Close(); err != nil {
+				return fmt.Errorf("failed to close gzip writer: %v", err)
+			}
+			if err := tmpFile.Close(); err != nil {
+				return fmt.Errorf("failed to close temporary file: %v", err)
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Successfully published directory as OCI image: %s\n", name)
+			// Create a new empty image
+			img := empty.Image
+
+			// Add the layer to the image
+			layer, err := tarball.LayerFromFile(tmpFile.Name())
+			if err != nil {
+				return fmt.Errorf("failed to create layer from tarball: %v", err)
+			}
+
+			img, err = mutate.Append(img, mutate.Addendum{
+				Layer: layer,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to append layer to image: %v", err)
+			}
+
+			// Parse the image reference
+			ref, err := name.ParseReference(imageName)
+			if err != nil {
+				return fmt.Errorf("failed to parse image reference: %v", err)
+			}
+
+			// Push the image
+			if err := crane.Push(img, ref.String()); err != nil {
+				return fmt.Errorf("failed to push image: %v", err)
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "Successfully published directory as OCI image: %s\n", imageName)
 			return nil
 		},
 	}

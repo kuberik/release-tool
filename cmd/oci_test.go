@@ -2,12 +2,15 @@ package cmd
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/kuberik/release-tool/cmd/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -91,13 +94,52 @@ func TestOciCommand(t *testing.T) {
 			assert.Contains(t, output.String(), "Successfully published directory as OCI image: "+tt.imageName)
 
 			// Verify the image exists in the registry
-			craneCmd := exec.Command("crane", "manifest", "--insecure", tt.imageName)
-			manifestOutput, err := craneCmd.CombinedOutput()
-			if err != nil {
-				t.Logf("crane manifest output: %s", manifestOutput)
+			ref, err := name.ParseReference(tt.imageName)
+			require.NoError(t, err)
+
+			// Pull the image
+			img, err := crane.Pull(ref.String())
+			require.NoError(t, err)
+
+			// Get the manifest
+			manifest, err := img.Manifest()
+			require.NoError(t, err)
+			require.Len(t, manifest.Layers, 1, "Expected exactly one layer")
+
+			// Create a temporary directory for extraction
+			extractDir := t.TempDir()
+
+			// Get the layer
+			layer, err := img.LayerByDigest(manifest.Layers[0].Digest)
+			require.NoError(t, err)
+
+			// Read and extract the layer
+			rc, err := layer.Uncompressed()
+			require.NoError(t, err)
+			defer rc.Close()
+
+			// Create a temporary file for the tar
+			tarFile, err := os.CreateTemp("", "layer-*.tar")
+			require.NoError(t, err)
+			defer os.Remove(tarFile.Name())
+
+			// Copy the layer content to the tar file
+			_, err = io.Copy(tarFile, rc)
+			require.NoError(t, err)
+			err = tarFile.Close()
+			require.NoError(t, err)
+
+			// Extract the tar file
+			err = exec.Command("tar", "-xf", tarFile.Name(), "-C", extractDir).Run()
+			require.NoError(t, err)
+
+			// Verify all test files exist in the extracted image
+			for _, file := range testFiles {
+				path := filepath.Join(extractDir, file.path)
+				content, err := os.ReadFile(path)
+				require.NoError(t, err)
+				assert.Equal(t, file.content, string(content))
 			}
-			assert.NoError(t, err)
-			assert.NotEmpty(t, manifestOutput)
 		})
 	}
 }
