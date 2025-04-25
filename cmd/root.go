@@ -18,6 +18,7 @@ func NewRootCmd() *cobra.Command {
 	}
 
 	rootCmd.AddCommand(NewPublishCmd())
+	rootCmd.AddCommand(NewOciCmd())
 	return rootCmd
 }
 
