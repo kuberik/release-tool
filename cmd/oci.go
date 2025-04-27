@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Masterminds/semver/v3"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -19,62 +18,69 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// getLatestVersionTag returns the latest semantic version tag from git history
-func getLatestVersionTag(dir string) (string, error) {
-	// Get current branch
-	branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	branchCmd.Dir = dir
-	branchOutput, err := branchCmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current branch: %v", err)
+// getLatestVersionTag returns the version from the latest commit's tag
+func getLatestVersionTag(dir string, name string) (string, error) {
+	// Check if directory is a git repository
+	gitCheckCmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	gitCheckCmd.Dir = dir
+	if err := gitCheckCmd.Run(); err != nil {
+		// Not a git repository, return default version
+		return "0.0.0", nil
 	}
-	currentBranch := strings.TrimSpace(string(branchOutput))
 
-	// Get all tags reachable from current branch
-	cmd := exec.Command("git", "tag", "--merged", currentBranch)
+	// Get the latest commit's tag
+	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to get git tags: %v", err)
-	}
-
-	// Parse tags and find the latest version
-	tags := strings.Split(strings.TrimSpace(string(output)), "\n")
-	var latestVersion *semver.Version
-
-	for _, tag := range tags {
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
-			continue
-		}
-
-		// Try to parse as semver
-		version, err := semver.NewVersion(tag)
+		// No tag found, get the current commit hash
+		hashCmd := exec.Command("git", "rev-parse", "HEAD")
+		hashCmd.Dir = dir
+		hashOutput, err := hashCmd.Output()
 		if err != nil {
-			continue // Skip non-semver tags
+			return "", fmt.Errorf("failed to get commit hash: %v", err)
 		}
-
-		if latestVersion == nil || version.GreaterThan(latestVersion) {
-			latestVersion = version
-		}
+		return strings.TrimSpace(string(hashOutput)), nil
 	}
 
-	if latestVersion == nil {
-		return "0.0.0", nil // Return a default version if no tags found
+	tag := strings.TrimSpace(string(output))
+	// Look for [name]/v* pattern
+	prefix := name + "/v"
+	if !strings.HasPrefix(tag, prefix) {
+		// No matching tag found, get the current commit hash
+		hashCmd := exec.Command("git", "rev-parse", "HEAD")
+		hashCmd.Dir = dir
+		hashOutput, err := hashCmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("failed to get commit hash: %v", err)
+		}
+		return strings.TrimSpace(string(hashOutput)), nil
 	}
 
-	return latestVersion.String(), nil
+	// Extract version from tag
+	versionStr := strings.TrimPrefix(tag, prefix)
+	// Remove any trailing characters (like ^0)
+	versionStr = strings.TrimSuffix(versionStr, "^0")
+	return versionStr, nil
 }
 
 func NewOciCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "oci [name] [directory]",
+	var insecure bool
+	cmd := &cobra.Command{
+		Use:   "oci [release-name] [name] [directory]",
 		Short: "Publish a directory as an OCI image",
 		Long:  `Publish a directory as an OCI image using crane.`,
-		Args:  cobra.ExactArgs(2),
+		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			imageName := args[0]
-			dir := args[1]
+			releaseName := args[0]
+			imageName := args[1]
+			dir := args[2]
+
+			// Extract the name part from the image reference
+			ref, err := name.ParseReference(imageName)
+			if err != nil {
+				return fmt.Errorf("failed to parse image reference: %v", err)
+			}
 
 			// Check if directory exists
 			if !filepath.IsAbs(dir) {
@@ -91,7 +97,7 @@ func NewOciCmd() *cobra.Command {
 			}
 
 			// Get the latest version tag
-			latestVersion, err := getLatestVersionTag(dir)
+			latestVersion, err := getLatestVersionTag(dir, releaseName)
 			if err != nil {
 				return fmt.Errorf("failed to get latest version tag: %v", err)
 			}
@@ -202,19 +208,32 @@ func NewOciCmd() *cobra.Command {
 				return fmt.Errorf("failed to append layer to image: %v", err)
 			}
 
-			// Parse the image reference
-			ref, err := name.ParseReference(imageName)
-			if err != nil {
-				return fmt.Errorf("failed to parse image reference: %v", err)
+			// Push the image
+			opts := []crane.Option{}
+			if insecure {
+				opts = append(opts, crane.Insecure)
 			}
 
-			// Push the image
-			if err := crane.Push(img, ref.String()); err != nil {
+			// Push with latest tag
+			if err := crane.Push(img, ref.String(), opts...); err != nil {
 				return fmt.Errorf("failed to push image: %v", err)
 			}
 
+			// Push with version tag
+			versionRef, err := name.NewTag(strings.TrimSuffix(ref.String(), ":latest") + ":" + latestVersion)
+			if err != nil {
+				return fmt.Errorf("failed to create version tag reference: %v", err)
+			}
+			if err := crane.Push(img, versionRef.String(), opts...); err != nil {
+				return fmt.Errorf("failed to push version tag: %v", err)
+			}
+
 			fmt.Fprintf(cmd.OutOrStdout(), "Successfully published directory as OCI image: %s\n", imageName)
+			fmt.Fprintf(cmd.OutOrStdout(), "Added version tag: %s\n", versionRef.String())
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&insecure, "insecure", false, "Allow pushing to insecure registries")
+	return cmd
 }

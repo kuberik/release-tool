@@ -49,18 +49,21 @@ func TestOciCommand(t *testing.T) {
 	// Test cases
 	tests := []struct {
 		name        string
+		releaseName string
 		imageName   string
 		dir         string
 		expectError bool
 		matchError  string
 	}{
 		{
-			name:      "valid-directory",
-			imageName: strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
-			dir:       testDir,
+			name:        "valid-directory",
+			releaseName: "test",
+			imageName:   strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
+			dir:         testDir,
 		},
 		{
 			name:        "non-existent-directory",
+			releaseName: "test",
 			imageName:   strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
 			dir:         "/non/existent/dir",
 			expectError: true,
@@ -79,7 +82,7 @@ func TestOciCommand(t *testing.T) {
 			cmd.SetErr(output)
 
 			// Prepare command arguments
-			args := []string{"oci", tt.imageName, tt.dir}
+			args := []string{"oci", tt.releaseName, tt.imageName, tt.dir}
 			cmd.SetArgs(args)
 
 			// Execute command
@@ -93,12 +96,13 @@ func TestOciCommand(t *testing.T) {
 
 			assert.NoError(t, err)
 			assert.Contains(t, output.String(), "Successfully published directory as OCI image: "+tt.imageName)
+			assert.Contains(t, output.String(), "Added version tag: "+strings.TrimSuffix(tt.imageName, ":latest")+":0.0.0")
 
 			// Verify the image exists in the registry
 			ref, err := name.ParseReference(tt.imageName)
 			require.NoError(t, err)
 
-			// Pull the image
+			// Pull the image with latest tag
 			img, err := crane.Pull(ref.String())
 			require.NoError(t, err)
 
@@ -196,33 +200,30 @@ func TestOciCommandWithVersionReplacement(t *testing.T) {
 		require.NoError(t, commitCmd.Run())
 
 		minorVersion++
-		tagCmd := exec.Command("git", "tag", fmt.Sprintf("v0.%d.0", minorVersion))
+		tagCmd := exec.Command("git", "tag", fmt.Sprintf("test/v0.%d.0", minorVersion))
 		tagCmd.Dir = testDir
 		require.NoError(t, tagCmd.Run())
 	}
 
 	// Checkout tag v0.2.0
-	checkoutTagCmd := exec.Command("git", "checkout", "v0.2.0")
+	checkoutTagCmd := exec.Command("git", "checkout", "test/v0.2.0")
 	checkoutTagCmd.Dir = testDir
 	require.NoError(t, checkoutTagCmd.Run())
-
-	// Create and checkout new branch release-0.2
-	checkoutBranchCmd := exec.Command("git", "checkout", "-b", "release-0.2")
-	checkoutBranchCmd.Dir = testDir
-	require.NoError(t, checkoutBranchCmd.Run())
 
 	// Test cases
 	tests := []struct {
 		name        string
+		releaseName string
 		imageName   string
 		dir         string
 		expectError bool
 		matchError  string
 	}{
 		{
-			name:      "version-replacement",
-			imageName: strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
-			dir:       testDir,
+			name:        "version-replacement",
+			releaseName: "test",
+			imageName:   strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
+			dir:         testDir,
 		},
 	}
 
@@ -240,7 +241,7 @@ func TestOciCommandWithVersionReplacement(t *testing.T) {
 			cmd.PersistentFlags().Set("dir", testDir)
 
 			// Prepare command arguments
-			args := []string{"oci", tt.imageName, tt.dir}
+			args := []string{"oci", tt.releaseName, tt.imageName, tt.dir}
 			cmd.SetArgs(args)
 
 			// Execute command
@@ -254,12 +255,13 @@ func TestOciCommandWithVersionReplacement(t *testing.T) {
 
 			assert.NoError(t, err)
 			assert.Contains(t, output.String(), "Successfully published directory as OCI image: "+tt.imageName)
+			assert.Contains(t, output.String(), "Added version tag: "+strings.TrimSuffix(tt.imageName, ":latest")+":0.2.0")
 
 			// Verify the image exists in the registry
 			ref, err := name.ParseReference(tt.imageName)
 			require.NoError(t, err)
 
-			// Pull the image
+			// Pull the image with latest tag
 			img, err := crane.Pull(ref.String())
 			require.NoError(t, err)
 
@@ -267,6 +269,15 @@ func TestOciCommandWithVersionReplacement(t *testing.T) {
 			manifest, err := img.Manifest()
 			require.NoError(t, err)
 			require.Len(t, manifest.Layers, 1, "Expected exactly one layer")
+
+			// Verify version tag exists
+			versionRef, err := name.NewTag(strings.TrimSuffix(ref.String(), ":latest") + ":0.2.0")
+			require.NoError(t, err)
+			versionImg, err := crane.Pull(versionRef.String())
+			require.NoError(t, err)
+			versionManifest, err := versionImg.Manifest()
+			require.NoError(t, err)
+			require.Len(t, versionManifest.Layers, 1, "Expected exactly one layer")
 
 			// Create a temporary directory for extraction
 			extractDir := t.TempDir()
@@ -307,6 +318,115 @@ func TestOciCommandWithVersionReplacement(t *testing.T) {
 			}
 			_, err = os.Stat(filepath.Join(extractDir, testFiles[2].path))
 			assert.Error(t, err)
+		})
+	}
+}
+
+func TestOciCommandWithCommitHash(t *testing.T) {
+	// Start a local registry
+	registry := testhelpers.LocalRegistry()
+	defer registry.Close()
+
+	// Create a temporary directory for testing
+	testDir := t.TempDir()
+
+	// Initialize git repository
+	cmds := []*exec.Cmd{
+		exec.Command("git", "init"),
+		exec.Command("git", "config", "user.name", "Test User"),
+		exec.Command("git", "config", "user.email", "test@example.com"),
+	}
+
+	for _, cmd := range cmds {
+		cmd.Dir = testDir
+		require.NoError(t, cmd.Run())
+	}
+
+	// Create a test file
+	testFile := "test.txt"
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, testFile), []byte("content1"), 0644))
+
+	// Add and commit
+	addCmd := exec.Command("git", "add", testFile)
+	addCmd.Dir = testDir
+	require.NoError(t, addCmd.Run())
+
+	commitCmd := exec.Command("git", "commit", "-m", "Add test file")
+	commitCmd.Dir = testDir
+	require.NoError(t, commitCmd.Run())
+
+	// Get the commit hash
+	hashCmd := exec.Command("git", "rev-parse", "HEAD")
+	hashCmd.Dir = testDir
+	commitHash, err := hashCmd.Output()
+	require.NoError(t, err)
+	commitHash = bytes.TrimSpace(commitHash)
+
+	// Test cases
+	tests := []struct {
+		name        string
+		releaseName string
+		imageName   string
+		dir         string
+		expectError bool
+		matchError  string
+	}{
+		{
+			name:        "commit-hash-tag",
+			releaseName: "test",
+			imageName:   strings.TrimPrefix(registry.URL, "http://") + "/test/image:latest",
+			dir:         testDir,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a new command for each test
+			cmd := NewRootCmd()
+
+			// Capture command output
+			output := &bytes.Buffer{}
+			cmd.SetOut(output)
+			cmd.SetErr(output)
+
+			// Prepare command arguments
+			args := []string{"oci", tt.releaseName, tt.imageName, tt.dir}
+			cmd.SetArgs(args)
+
+			// Execute command
+			err := cmd.Execute()
+
+			if tt.expectError {
+				assert.Error(t, err)
+				assert.Contains(t, output.String(), tt.matchError)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Contains(t, output.String(), "Successfully published directory as OCI image: "+tt.imageName)
+			assert.Contains(t, output.String(), "Added version tag: "+strings.TrimSuffix(tt.imageName, ":latest")+":"+string(commitHash))
+
+			// Verify the image exists in the registry
+			ref, err := name.ParseReference(tt.imageName)
+			require.NoError(t, err)
+
+			// Pull the image with latest tag
+			img, err := crane.Pull(ref.String())
+			require.NoError(t, err)
+
+			// Get the manifest
+			manifest, err := img.Manifest()
+			require.NoError(t, err)
+			require.Len(t, manifest.Layers, 1, "Expected exactly one layer")
+
+			// Verify commit hash tag exists
+			hashRef, err := name.NewTag(strings.TrimSuffix(ref.String(), ":latest") + ":" + string(commitHash))
+			require.NoError(t, err)
+			hashImg, err := crane.Pull(hashRef.String())
+			require.NoError(t, err)
+			hashManifest, err := hashImg.Manifest()
+			require.NoError(t, err)
+			require.Len(t, hashManifest.Layers, 1, "Expected exactly one layer")
 		})
 	}
 }

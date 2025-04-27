@@ -99,6 +99,11 @@ func setupTestRepo(t *testing.T) (string, string) {
 	pushCmd.Dir = localDir
 	require.NoError(t, pushCmd.Run())
 
+	// Push the initial commit to master
+	pushMasterCmd := exec.Command("git", "push", "origin", "master")
+	pushMasterCmd.Dir = localDir
+	require.NoError(t, pushMasterCmd.Run())
+
 	return localDir, remoteDir
 }
 
@@ -116,36 +121,18 @@ func TestPublishCommand(t *testing.T) {
 	tests := []struct {
 		name            string
 		releaseName     string
-		paths           []string
 		expectError     bool
 		matchError      string
 		expectedVersion string
 	}{
 		{
-			name:            "file",
+			name:            "first-release",
 			releaseName:     "rel-a",
-			paths:           []string{"file1.txt"},
 			expectedVersion: "0.1",
-		},
-		{
-			name:            "dir",
-			releaseName:     "rel-b",
-			paths:           []string{"dir/"},
-			expectError:     false,
-			expectedVersion: "0.1",
-		},
-		{
-			name:            "non-existent-file",
-			releaseName:     "rel-c",
-			paths:           []string{"nonexistent.txt"},
-			expectError:     true,
-			matchError:      "no commits found for the specified paths",
 		},
 		{
 			name:            "version-increment",
 			releaseName:     "rel-d",
-			paths:           []string{"newfile1.txt"},
-			expectError:     false,
 			expectedVersion: "0.2",
 		},
 	}
@@ -161,7 +148,7 @@ func TestPublishCommand(t *testing.T) {
 			cmd.SetErr(output)
 
 			// Prepare command arguments
-			args := append([]string{"publish", tt.releaseName}, tt.paths...)
+			args := []string{"publish", tt.releaseName}
 			cmd.SetArgs(args)
 
 			// Execute command
@@ -175,13 +162,113 @@ func TestPublishCommand(t *testing.T) {
 
 			assert.NoError(t, err)
 			assert.Contains(t, output.String(), "Pushed new release branch: release-"+tt.releaseName+"-")
+			assert.Contains(t, output.String(), "Created and pushed tag: "+tt.releaseName+"/v"+tt.expectedVersion+".0")
 
 			// Verify remote branch was created
 			lsRemoteCmd := exec.Command("git", "ls-remote", "--heads", remoteDir, "release-"+tt.releaseName+"-*")
 			branchOutput, err := lsRemoteCmd.Output()
 			assert.NoError(t, err)
-
 			assert.Contains(t, string(branchOutput), "release-"+tt.releaseName+"-"+tt.expectedVersion)
+
+			// Verify tag was created and pushed
+			lsRemoteTagsCmd := exec.Command("git", "ls-remote", "--tags", remoteDir, tt.releaseName+"/v"+tt.expectedVersion+".0")
+			tagOutput, err := lsRemoteTagsCmd.Output()
+			assert.NoError(t, err)
+			assert.Contains(t, string(tagOutput), tt.releaseName+"/v"+tt.expectedVersion+".0")
+
+			// Verify tag points to the same commit as the branch
+			branchRefCmd := exec.Command("git", "ls-remote", remoteDir, "refs/heads/release-"+tt.releaseName+"-"+tt.expectedVersion)
+			branchRefOutput, err := branchRefCmd.Output()
+			assert.NoError(t, err)
+			branchCommit := strings.Split(string(branchRefOutput), "\t")[0]
+
+			tagRefCmd := exec.Command("git", "ls-remote", remoteDir, "refs/tags/"+tt.releaseName+"/v"+tt.expectedVersion+".0")
+			tagRefOutput, err := tagRefCmd.Output()
+			assert.NoError(t, err)
+			tagCommit := strings.Split(string(tagRefOutput), "\t")[0]
+
+			assert.Equal(t, branchCommit, tagCommit, "Tag should point to the same commit as the branch")
 		})
 	}
+}
+
+func TestPublishCommandMultipleVersions(t *testing.T) {
+	// Setup test repository
+	localDir, remoteDir := setupTestRepo(t)
+
+	// Change to test directory
+	oldDir, err := os.Getwd()
+	require.NoError(t, err)
+	defer os.Chdir(oldDir)
+	require.NoError(t, os.Chdir(localDir))
+
+	// Create a test file
+	testFile := "test.txt"
+	require.NoError(t, os.WriteFile(testFile, []byte("content1"), 0644))
+
+	// Add and commit
+	addCmd := exec.Command("git", "add", testFile)
+	addCmd.Dir = localDir
+	require.NoError(t, addCmd.Run())
+
+	commitCmd := exec.Command("git", "commit", "-m", "Add test file")
+	commitCmd.Dir = localDir
+	require.NoError(t, commitCmd.Run())
+
+	// First publish
+	cmd := NewRootCmd()
+	output := &bytes.Buffer{}
+	cmd.SetOut(output)
+	cmd.SetErr(output)
+	cmd.SetArgs([]string{"publish", "test"})
+	require.NoError(t, cmd.Execute())
+	assert.Contains(t, output.String(), "Pushed new release branch: release-test-0.1")
+	assert.Contains(t, output.String(), "Created and pushed tag: test/v0.1.0")
+
+	// Modify file and commit
+	require.NoError(t, os.WriteFile(testFile, []byte("content2"), 0644))
+	addCmd = exec.Command("git", "add", testFile)
+	addCmd.Dir = localDir
+	require.NoError(t, addCmd.Run())
+
+	commitCmd = exec.Command("git", "commit", "-m", "Update test file")
+	commitCmd.Dir = localDir
+	require.NoError(t, commitCmd.Run())
+
+	// Second publish
+	cmd = NewRootCmd()
+	output = &bytes.Buffer{}
+	cmd.SetOut(output)
+	cmd.SetErr(output)
+	cmd.SetArgs([]string{"publish", "test"})
+	require.NoError(t, cmd.Execute())
+	assert.Contains(t, output.String(), "Pushed new release branch: release-test-0.2")
+	assert.Contains(t, output.String(), "Created and pushed tag: test/v0.2.0")
+
+	// Verify remote branches
+	lsRemoteCmd := exec.Command("git", "ls-remote", "--heads", remoteDir, "release-test-*")
+	branchOutput, err := lsRemoteCmd.Output()
+	require.NoError(t, err)
+	assert.Contains(t, string(branchOutput), "release-test-0.1")
+	assert.Contains(t, string(branchOutput), "release-test-0.2")
+
+	// Verify tags
+	lsRemoteTagsCmd := exec.Command("git", "ls-remote", "--tags", remoteDir, "test/v*")
+	tagOutput, err := lsRemoteTagsCmd.Output()
+	require.NoError(t, err)
+	assert.Contains(t, string(tagOutput), "test/v0.1.0")
+	assert.Contains(t, string(tagOutput), "test/v0.2.0")
+
+	// Verify tag commits are different
+	tag1Cmd := exec.Command("git", "ls-remote", remoteDir, "refs/tags/test/v0.1.0")
+	tag1Output, err := tag1Cmd.Output()
+	require.NoError(t, err)
+	tag1Commit := strings.Split(string(tag1Output), "\t")[0]
+
+	tag2Cmd := exec.Command("git", "ls-remote", remoteDir, "refs/tags/test/v0.2.0")
+	tag2Output, err := tag2Cmd.Output()
+	require.NoError(t, err)
+	tag2Commit := strings.Split(string(tag2Output), "\t")[0]
+
+	assert.NotEqual(t, tag1Commit, tag2Commit, "Tags should point to different commits")
 }
