@@ -18,72 +18,89 @@ func NewPublishCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 
-			// Get git log
-			gitLogCmd := exec.Command("git", "log", "--oneline")
-			output, err := gitLogCmd.Output()
+			// Get current commit hash
+			headCmd := exec.Command("git", "rev-parse", "HEAD")
+			headOutput, err := headCmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to get current commit: %v", err)
+			}
+			currentCommit := strings.TrimSpace(string(headOutput))
+
+			// Get current branch name
+			branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+			branchOutput, err := branchCmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to get current branch: %v", err)
+			}
+			currentBranch := strings.TrimSpace(string(branchOutput))
+
+			// Check if we're on a release branch
+			isReleaseBranch := strings.HasPrefix(currentBranch, "release-"+name+"-")
+
+			// Get latest version from git history
+			logCmd := exec.Command("git", "log", "--pretty=format:%D", "--simplify-by-decoration", "HEAD")
+			logOutput, err := logCmd.Output()
 			if err != nil {
 				return fmt.Errorf("failed to get git log: %v", err)
-			} else if len(output) == 0 {
-				return fmt.Errorf("no commits found")
 			}
 
-			// Get the first commit hash
-			lines := strings.Split(string(output), "\n")
-			firstCommit := strings.Split(lines[0], " ")[0]
-
-			// Get all remote branches
-			lsRemoteCmd := exec.Command("git", "ls-remote", "--heads", "origin", "release-"+name+"-*")
-			remoteOutput, err := lsRemoteCmd.Output()
-			if err != nil {
-				return fmt.Errorf("failed to list remote branches: %v", err)
-			}
-
-			// Parse existing versions
+			// Parse tags and find latest version
 			latestVersion := semver.MustParse("0.0.0")
-			remoteBranches := strings.Split(string(remoteOutput), "\n")
-			for _, branch := range remoteBranches {
-				if branch == "" {
+			lines := strings.Split(string(logOutput), "\n")
+		find_loop:
+			for _, line := range lines {
+				if line == "" {
 					continue
 				}
-				parts := strings.Split(branch, "\t")
-				if len(parts) != 2 {
-					continue
-				}
-				branchName := strings.TrimPrefix(parts[1], "refs/heads/")
-				if strings.HasPrefix(branchName, "release-"+name+"-") {
-					versionStr := strings.TrimPrefix(branchName, "release-"+name+"-")
-					// Add .0 to make it a valid semver
-					version, err := semver.NewVersion(versionStr + ".0")
-					if err == nil && version.GreaterThan(latestVersion) {
-						latestVersion = version
+				// Extract tags from git log output (format: tag: name/v1.2.3)
+				tags := strings.Split(strings.TrimSpace(line), ", ")
+				for _, tag := range tags {
+					tag := strings.TrimSpace(tag)
+					if strings.HasPrefix(tag, "tag: "+name+"/v") {
+						versionStr := strings.TrimPrefix(tag, "tag: "+name+"/v")
+						version, err := semver.NewVersion(versionStr)
+						if err == nil {
+							latestVersion = version
+							break find_loop
+						}
 					}
 				}
 			}
 
-			// Increment the minor version
-			newVersion := semver.MustParse(fmt.Sprintf("%d.%d.0", latestVersion.Major(), latestVersion.Minor()+1))
-			newBranch := fmt.Sprintf("release-%s-%d.%d", name, newVersion.Major(), newVersion.Minor())
+			var newVersion *semver.Version
 
-			// Push directly to remote
-			pushCmd := exec.Command("git", "push", "origin", firstCommit+":refs/heads/"+newBranch)
-			if err := pushCmd.Run(); err != nil {
-				return fmt.Errorf("failed to push branch: %v", err)
+			if isReleaseBranch {
+				// For patch releases, increment from the current version's patch
+				newVersion = semver.MustParse(fmt.Sprintf("%d.%d.%d", latestVersion.Major(), latestVersion.Minor(), latestVersion.Patch()+1))
+
+				// Push the current branch
+				pushCmd := exec.Command("git", "push", "origin", currentBranch)
+				if err := pushCmd.Run(); err != nil {
+					return fmt.Errorf("failed to push branch: %v", err)
+				}
+			} else {
+				newVersion = semver.MustParse(fmt.Sprintf("%d.%d.%d", latestVersion.Major(), latestVersion.Minor()+1, latestVersion.Patch()))
+				newBranch := fmt.Sprintf("release-%s-%d.%d", name, newVersion.Major(), newVersion.Minor())
+				pushCmd := exec.Command("git", "push", "origin", currentCommit+":refs/heads/"+newBranch)
+				if err := pushCmd.Run(); err != nil {
+					return fmt.Errorf("failed to push branch: %v", err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Pushed new release branch: %s\n", newBranch)
 			}
 
 			// Create and push a tag for this release
-			tagName := fmt.Sprintf("%s/v%d.%d.0", name, newVersion.Major(), newVersion.Minor())
-			tagCmd := exec.Command("git", "tag", tagName, firstCommit)
+			tagName := fmt.Sprintf("%s/v%d.%d.%d", name, newVersion.Major(), newVersion.Minor(), newVersion.Patch())
+			tagCmd := exec.Command("git", "tag", "-f", tagName, currentCommit)
 			if err := tagCmd.Run(); err != nil {
 				return fmt.Errorf("failed to create tag: %v", err)
 			}
 
 			// Push the tag
-			pushTagCmd := exec.Command("git", "push", "origin", tagName)
+			pushTagCmd := exec.Command("git", "push", "-f", "origin", tagName)
 			if err := pushTagCmd.Run(); err != nil {
 				return fmt.Errorf("failed to push tag: %v", err)
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Pushed new release branch: %s\n", newBranch)
 			fmt.Fprintf(cmd.OutOrStdout(), "Created and pushed tag: %s\n", tagName)
 			return nil
 		},
