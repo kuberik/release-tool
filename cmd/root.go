@@ -13,6 +13,7 @@ func NewRootCmd() *cobra.Command {
 
 	rootCmd.AddCommand(NewPublishCmd())
 	rootCmd.AddCommand(NewOciCmd())
+	rootCmd.AddCommand(NewVersionCmd())
 	return rootCmd
 }
 

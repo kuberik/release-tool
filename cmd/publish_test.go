@@ -167,6 +167,16 @@ func TestPublishCommand(t *testing.T) {
 	assert.Contains(t, string(tagOutput), "test/v0.1.1")
 	assert.Contains(t, string(tagOutput), "test/v0.2.0")
 	assert.Contains(t, string(tagOutput), "test/v0.3.0")
+
+	// Try to publish again without any new commits
+	cmd := NewRootCmd()
+	errorOutput := &bytes.Buffer{}
+	cmd.SetOut(errorOutput)
+	cmd.SetErr(errorOutput)
+	cmd.SetArgs([]string{"publish", "test"})
+	err = cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, errorOutput.String(), "no new commits to tag")
 }
 
 func TestPublishCommandMultipleVersions(t *testing.T) {

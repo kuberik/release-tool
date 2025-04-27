@@ -26,6 +26,13 @@ func NewPublishCmd() *cobra.Command {
 			}
 			currentCommit := strings.TrimSpace(string(headOutput))
 
+			// Check if this commit is already tagged with a version tag for this release
+			tagCmd := exec.Command("git", "tag", "--points-at", currentCommit, name+"/v*")
+			output, err := tagCmd.Output()
+			if err == nil && len(output) > 0 {
+				return fmt.Errorf("no new commits to tag")
+			}
+
 			// Get current branch name
 			branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 			branchOutput, err := branchCmd.Output()
@@ -90,7 +97,7 @@ func NewPublishCmd() *cobra.Command {
 
 			// Create and push a tag for this release
 			tagName := fmt.Sprintf("%s/v%d.%d.%d", name, newVersion.Major(), newVersion.Minor(), newVersion.Patch())
-			tagCmd := exec.Command("git", "tag", "-f", tagName, currentCommit)
+			tagCmd = exec.Command("git", "tag", "-f", tagName, currentCommit)
 			if err := tagCmd.Run(); err != nil {
 				return fmt.Errorf("failed to create tag: %v", err)
 			}
